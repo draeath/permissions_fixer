@@ -1,11 +1,18 @@
 //! Tree walk and permission application.
+//!
+//! The walk is multithreaded: a pool of workers pulls directories from a
+//! shared queue and processes them, so entries are recorded in completion
+//! order, which is not deterministic.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::exec;
 use crate::mode;
@@ -54,6 +61,10 @@ pub struct Report {
 /// that is itself a symlink *is* followed, so passing a link to a directory
 /// behaves like passing the directory. Per-entry failures are recorded as
 /// [`Action::Error`] and the walk continues.
+///
+/// The walk runs on a pool of threads (one per available processor); the
+/// order of the returned entries depends on scheduling and is not
+/// deterministic.
 pub fn run(root: &Path, umask: u32, opts: &Options) -> Result<Vec<Entry>, io::Error> {
     let root_meta = fs::metadata(root).map_err(|err| {
         io::Error::new(
@@ -61,10 +72,12 @@ pub fn run(root: &Path, umask: u32, opts: &Options) -> Result<Vec<Entry>, io::Er
             format!("cannot access {}: {err}", root.display()),
         )
     })?;
-    let mut entries = Vec::new();
-    apply_entry(root, &root_meta, umask, opts, &mut entries);
+    let mut entries = process_entry(root, &root_meta, umask, opts);
     if root_meta.is_dir() {
-        walk(root, root_meta.dev(), umask, opts, &mut entries);
+        let nthreads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        entries.extend(walk_parallel(root, root_meta.dev(), umask, opts, nthreads));
     }
     Ok(entries)
 }
@@ -86,13 +99,13 @@ pub fn report(entries: &[Entry]) -> Report {
     rep
 }
 
-fn apply_entry(
-    path: &Path,
-    meta: &fs::Metadata,
-    umask: u32,
-    opts: &Options,
-    entries: &mut Vec<Entry>,
-) {
+/// Compute and apply the permission change for one entry.
+///
+/// Returns one [`Entry`] normally, or two when the executable detection
+/// fails: the [`Action::Error`] for the read failure plus the entry for the
+/// permission change, which is still applied.
+fn process_entry(path: &Path, meta: &fs::Metadata, umask: u32, opts: &Options) -> Vec<Entry> {
+    let mut entries = Vec::new();
     let is_dir = meta.is_dir();
     let current = meta.mode() & 0o7777;
 
@@ -121,7 +134,7 @@ fn apply_entry(
             path: path.to_path_buf(),
             action: Action::Unchanged { mode: current },
         });
-        return;
+        return entries;
     }
     if opts.dry_run {
         entries.push(Entry {
@@ -131,7 +144,7 @@ fn apply_entry(
                 to: desired,
             },
         });
-        return;
+        return entries;
     }
     match fs::set_permissions(path, fs::Permissions::from_mode(desired)) {
         Ok(()) => entries.push(Entry {
@@ -148,9 +161,111 @@ fn apply_entry(
             },
         }),
     }
+    entries
 }
 
-fn walk(dir: &Path, root_dev: u64, umask: u32, opts: &Options, entries: &mut Vec<Entry>) {
+/// How many directories a worker pulls from the queue per lock acquisition.
+const QUEUE_BATCH: usize = 32;
+/// How many subdirectories are buffered before being pushed to the shared
+/// queue, so other workers see the work while a fan-out directory is still
+/// being processed.
+const PUSH_CHUNK: usize = 64;
+
+/// Parallel walk over the children of `root` and their subtrees.
+///
+/// `nthreads` workers pull batches of directories from a shared queue and
+/// process them (permission changes, special files, mount points),
+/// enqueuing same-device subdirectories in chunks. Each worker accumulates
+/// its own entry list, merged after join, so recording entries never
+/// contends. A worker exits only when the queue is empty *and* no worker
+/// holds a batch, so the walk always drains completely. Order across
+/// directories is nondeterministic.
+fn walk_parallel(
+    root: &Path,
+    root_dev: u64,
+    umask: u32,
+    opts: &Options,
+    nthreads: usize,
+) -> Vec<Entry> {
+    let nthreads = nthreads.max(1);
+    let opts = *opts; // copied: the worker closures are 'static
+    let queue: Arc<Mutex<VecDeque<PathBuf>>> =
+        Arc::new(Mutex::new(VecDeque::from([root.to_path_buf()])));
+    // Count of workers holding a non-empty batch; an empty queue plus zero
+    // in-flight workers proves the walk is complete.
+    let in_flight: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::with_capacity(nthreads);
+    for _ in 0..nthreads {
+        let queue = Arc::clone(&queue);
+        let in_flight = Arc::clone(&in_flight);
+        handles.push(std::thread::spawn(move || -> Vec<Entry> {
+            let mut entries = Vec::new();
+            let mut batch = Vec::with_capacity(QUEUE_BATCH);
+            loop {
+                // Take a whole batch under one lock acquisition, and count
+                // the take while still holding it: a directory is either in
+                // the queue or visible in `in_flight`, never in an uncounted
+                // in-between state.
+                batch.clear();
+                {
+                    let mut q = queue.lock().unwrap();
+                    for _ in 0..QUEUE_BATCH {
+                        match q.pop_front() {
+                            Some(dir) => batch.push(dir),
+                            None => break,
+                        }
+                    }
+                    if !batch.is_empty() {
+                        in_flight.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                if batch.is_empty() {
+                    if in_flight.load(Ordering::Acquire) == 0 {
+                        return entries;
+                    }
+                    std::thread::yield_now();
+                    continue;
+                }
+                let guard = InFlight {
+                    count: in_flight.clone(),
+                };
+                for dir in &batch {
+                    process_dir(dir, root_dev, umask, &opts, &mut entries, &queue);
+                }
+                drop(guard);
+            }
+        }));
+    }
+    let mut all = Vec::new();
+    for handle in handles {
+        all.extend(handle.join().unwrap());
+    }
+    all
+}
+
+/// RAII decrement of the in-flight counter, so a panicking worker is still
+/// counted down and the walk cannot deadlock on a leaked count.
+struct InFlight {
+    count: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Process one directory: record an entry for each child, and enqueue
+/// same-device subdirectories for further processing.
+fn process_dir(
+    dir: &Path,
+    root_dev: u64,
+    umask: u32,
+    opts: &Options,
+    entries: &mut Vec<Entry>,
+    queue: &Mutex<VecDeque<PathBuf>>,
+) {
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(err) => {
@@ -163,11 +278,15 @@ fn walk(dir: &Path, root_dev: u64, umask: u32, opts: &Options, entries: &mut Vec
             return;
         }
     };
-    // Sorted order keeps the report deterministic (readdir order is not).
+    // Keep per-directory order deterministic; order across directories
+    // depends on worker scheduling.
     let mut paths: Vec<PathBuf> = read_dir
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .collect();
     paths.sort();
+    // Buffer subdirectory enqueues so a wide fan-out reaches the queue in
+    // chunks instead of one lock acquisition per entry.
+    let mut pending: Vec<PathBuf> = Vec::new();
     for path in paths {
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
@@ -182,9 +301,12 @@ fn walk(dir: &Path, root_dev: u64, umask: u32, opts: &Options, entries: &mut Vec
             }
         };
         if meta.is_dir() {
-            apply_entry(&path, &meta, umask, opts, entries);
+            entries.extend(process_entry(&path, &meta, umask, opts));
             if same_device(root_dev, meta.dev()) {
-                walk(&path, root_dev, umask, opts, entries);
+                pending.push(path);
+                if pending.len() >= PUSH_CHUNK {
+                    queue.lock().unwrap().extend(std::mem::take(&mut pending));
+                }
             } else {
                 entries.push(Entry {
                     path: path.clone(),
@@ -194,7 +316,7 @@ fn walk(dir: &Path, root_dev: u64, umask: u32, opts: &Options, entries: &mut Vec
                 });
             }
         } else if meta.is_file() {
-            apply_entry(&path, &meta, umask, opts, entries);
+            entries.extend(process_entry(&path, &meta, umask, opts));
         } else {
             entries.push(Entry {
                 path: path.clone(),
@@ -203,6 +325,9 @@ fn walk(dir: &Path, root_dev: u64, umask: u32, opts: &Options, entries: &mut Vec
                 },
             });
         }
+    }
+    if !pending.is_empty() {
+        queue.lock().unwrap().extend(std::mem::take(&mut pending));
     }
 }
 
@@ -526,5 +651,85 @@ mod tests {
 
         assert_eq!(rep.errors, 1, "detect() read failure must be recorded");
         assert_eq!(mode_of(f.as_ref()), 0o644, "chmod still applies");
+    }
+
+    /// `dirs` subdirectories, each with `files` files; dirs 0700, files 0600.
+    fn build_tree(root: &Path, dirs: usize, files: usize) {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for d in 0..dirs {
+            let dir = root.join(format!("d{d}"));
+            make_dir(&dir, 0o700);
+            for f in 0..files {
+                write_file(&dir.join(format!("f{f}")), b"x\n", 0o600);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_walk_fixes_wide_tree() {
+        let _m = mask(0o022);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        build_tree(root, 120, 3);
+
+        let entries = run(root, 0o022, &Options::default()).unwrap();
+        let rep = report(&entries);
+
+        let total = 120 * 3 + 120 + 1; // files + subdirs + root
+        assert_eq!(rep.checked, total);
+        assert_eq!(rep.changed, total);
+        assert_eq!(rep.skipped, 0);
+        assert_eq!(rep.errors, 0);
+        assert_eq!(mode_of(root), 0o755);
+        assert_eq!(mode_of(root.join("d0").as_ref()), 0o755);
+        assert_eq!(mode_of(root.join("d0").join("f0").as_ref()), 0o644);
+        assert_eq!(mode_of(root.join("d119").join("f2").as_ref()), 0o644);
+    }
+
+    #[test]
+    fn parallel_walk_deep_chain() {
+        let _m = mask(0o022);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let depth = 400;
+        let mut cur = root.to_path_buf();
+        // tempdir's own mode depends on mkdtemp/umask; make the starting
+        // state explicit.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for i in 0..depth {
+            cur = cur.join(format!("n{i}"));
+            std::fs::create_dir(&cur).unwrap();
+            std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        write_file(cur.join("leaf").as_ref(), b"l\n", 0o600);
+
+        let entries = run(root, 0o022, &Options::default()).unwrap();
+        let rep = report(&entries);
+
+        assert_eq!(rep.checked, depth + 2); // root + chain + leaf
+        assert_eq!(rep.changed, depth + 2);
+        assert_eq!(rep.errors, 0);
+        assert_eq!(mode_of(root), 0o755);
+        assert_eq!(mode_of(cur.as_ref()), 0o755);
+        assert_eq!(mode_of(cur.join("leaf").as_ref()), 0o644);
+    }
+
+    #[test]
+    fn parallel_walk_single_thread() {
+        let _m = mask(0o022);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        build_tree(root, 8, 2);
+
+        // walk_parallel covers root's children, not root itself.
+        let dev = std::fs::metadata(root).unwrap().dev();
+        let entries = walk_parallel(root, dev, 0o022, &Options::default(), 1);
+        let rep = report(&entries);
+
+        assert_eq!(rep.checked, 8 * 2 + 8);
+        assert_eq!(rep.changed, 8 * 2 + 8);
+        assert_eq!(rep.errors, 0);
+        assert_eq!(mode_of(root.join("d0").join("f1").as_ref()), 0o644);
+        assert_eq!(mode_of(root.join("d7").as_ref()), 0o755);
     }
 }
