@@ -62,10 +62,12 @@ fn usage_and_help() {
     assert!(help.stdout.contains("dry-run"), "stdout: {}", help.stdout);
     assert!(help.stdout.contains("verbose"), "stdout: {}", help.stdout);
 
+    // CARGO_PKG_VERSION tracks Cargo.toml, so this stays in sync when the
+    // package version is bumped.
     let version = run(vec!["--version".into()]);
     assert!(version.status.success());
     assert!(
-        version.stdout.contains("0.1.0"),
+        version.stdout.contains(env!("CARGO_PKG_VERSION")),
         "stdout: {}",
         version.stdout
     );
