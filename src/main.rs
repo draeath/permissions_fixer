@@ -1,18 +1,18 @@
-//! `permissions_fixer`: normalize file permissions across a directory tree
-//! according to the current umask.
+//! `permissions_fixer`: normalize file permissions across one or more
+//! paths (directory trees or single files) according to the current umask.
 //!
-//! The walk stays on the filesystem of the given path (like `find -xdev`)
-//! and never follows symlinks. Files become `0666 & !umask` and directories
-//! `0777 & !umask`; executable programs (ELF, a.out, PE, or Mach-O; shared
-//! objects do not count) and scripts with a shebang additionally get
-//! execute permission in every class that has read. Setuid, setgid, and
-//! sticky bits are preserved.
+//! Each path is anchored to its own filesystem (like `find -xdev` per start
+//! point) and symlinks are never followed. Files become `0666 & !umask` and
+//! directories `0777 & !umask`; executable programs (ELF, a.out, PE, or
+//! Mach-O; shared objects do not count) and scripts with a shebang
+//! additionally get execute permission in every class that has read.
+//! Setuid, setgid, and sticky bits are preserved.
 //!
 //! Exit codes: 0 on success, 1 if any entry could not be processed,
 //! 2 on usage errors.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -22,9 +22,11 @@ use permissions_fixer::scan::{self, Action, Options};
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Path to fix: a directory (the whole tree) or a single file.
-    /// A symlink root is followed.
-    path: PathBuf,
+    /// Paths to fix: a directory (the whole tree) or a single file.
+    /// A symlink root is followed. Each path is anchored to its own
+    /// filesystem, like `find -xdev` per start point.
+    #[arg(value_name = "PATH", required = true)]
+    paths: Vec<PathBuf>,
 
     /// Report changes without applying them.
     #[arg(short = 'n', long)]
@@ -42,13 +44,8 @@ fn main() -> ExitCode {
         dry_run: cli.dry_run,
     };
 
-    let entries = match scan::run(&cli.path, umask, &opts) {
-        Ok(entries) => entries,
-        Err(err) => {
-            eprintln!("permissions_fixer: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let roots: Vec<&Path> = cli.paths.iter().map(|p| p.as_path()).collect();
+    let entries = scan::run(&roots, umask, &opts);
     let report = scan::report(&entries);
 
     let show_actions = cli.dry_run || cli.verbose;

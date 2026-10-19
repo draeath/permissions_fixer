@@ -61,6 +61,8 @@ fn usage_and_help() {
     assert!(help.status.success(), "stderr: {}", help.stderr);
     assert!(help.stdout.contains("dry-run"), "stdout: {}", help.stdout);
     assert!(help.stdout.contains("verbose"), "stdout: {}", help.stdout);
+    // any number of paths is accepted
+    assert!(help.stdout.contains("<PATH>..."), "stdout: {}", help.stdout);
 
     // CARGO_PKG_VERSION tracks Cargo.toml, so this stays in sync when the
     // package version is bumped.
@@ -218,6 +220,220 @@ fn verbose_reports_everything_then_idempotent() {
         second.stdout
     );
     drop((dir, _outside));
+}
+
+/// Seed one standard tree under a root (dirs 0700, files 0600).
+fn seed_tree(root: &std::path::Path) {
+    // tempdir's own mode depends on mkdtemp/umask; make it explicit.
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    make_dir(root.join("sub").as_ref(), 0o700);
+    write_file(root.join("sub").join("deep.txt").as_ref(), b"deep\n", 0o600);
+    write_file(root.join("note.txt").as_ref(), b"note\n", 0o600);
+    write_file(root.join("script").as_ref(), b"#!/bin/sh\necho hi\n", 0o600);
+}
+
+#[test]
+fn multiple_roots_fix_every_root() {
+    let _m = mask(0o022);
+    let d1 = tempfile::tempdir().unwrap();
+    let d2 = tempfile::tempdir().unwrap();
+    seed_tree(d1.path());
+    seed_tree(d2.path());
+
+    let res = run(vec![root_arg(d1.path()), root_arg(d2.path())]);
+
+    assert!(res.status.success(), "stderr: {}", res.stderr);
+    assert!(
+        res.stdout.is_empty(),
+        "quiet prints nothing, got: {}",
+        res.stdout
+    );
+    assert!(
+        res.stderr.is_empty(),
+        "no errors expected, got: {}",
+        res.stderr
+    );
+
+    for r in [d1.path(), d2.path()] {
+        assert_eq!(mode_of(r), 0o755);
+        assert_eq!(mode_of(r.join("sub").as_ref()), 0o755);
+        assert_eq!(mode_of(r.join("sub").join("deep.txt").as_ref()), 0o644);
+        assert_eq!(mode_of(r.join("note.txt").as_ref()), 0o644);
+        assert_eq!(mode_of(r.join("script").as_ref()), 0o755);
+    }
+}
+
+#[test]
+fn multiple_roots_missing_one_still_processes_others() {
+    let _m = mask(0o022);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_tree(root);
+
+    let missing = "/definitely/not/here/permx_missing";
+    let res = run(vec![missing.into(), root_arg(root)]);
+
+    assert_eq!(res.status.code(), Some(1), "stderr: {}", res.stderr);
+    assert!(
+        res.stderr.contains("cannot access"),
+        "stderr: {}",
+        res.stderr
+    );
+    assert!(res.stderr.contains(missing), "stderr: {}", res.stderr);
+    // the good root was still fully processed
+    assert_eq!(mode_of(root), 0o755);
+    assert_eq!(mode_of(root.join("sub").as_ref()), 0o755);
+    assert_eq!(mode_of(root.join("note.txt").as_ref()), 0o644);
+    assert_eq!(mode_of(root.join("script").as_ref()), 0o755);
+}
+
+#[test]
+fn multiple_roots_dry_run_reports_all_and_changes_nothing() {
+    let _m = mask(0o022);
+    let d1 = tempfile::tempdir().unwrap();
+    let d2 = tempfile::tempdir().unwrap();
+    seed_tree(d1.path());
+    seed_tree(d2.path());
+
+    let res = run(vec!["-n".into(), root_arg(d1.path()), root_arg(d2.path())]);
+
+    assert!(res.status.success(), "stderr: {}", res.stderr);
+    for r in [d1.path(), d2.path()] {
+        assert!(
+            res.stdout.contains(&format!(
+                "{}: 0600 -> 0644 (dry-run)",
+                r.join("note.txt").display()
+            )),
+            "stdout: {}",
+            res.stdout
+        );
+        assert!(
+            res.stdout.contains(&format!(
+                "{}: 0600 -> 0755 (dry-run)",
+                r.join("script").display()
+            )),
+            "stdout: {}",
+            res.stdout
+        );
+    }
+    assert!(
+        res.stdout
+            .contains("summary: checked=10 changed=10 skipped=0 errors=0"),
+        "stdout: {}",
+        res.stdout
+    );
+    // nothing was applied
+    assert_eq!(mode_of(d1.path()), 0o700);
+    assert_eq!(mode_of(d1.path().join("note.txt").as_ref()), 0o600);
+    assert_eq!(mode_of(d2.path().join("script").as_ref()), 0o600);
+}
+
+#[test]
+fn mount_point_passed_as_its_own_root_is_descended() {
+    let _m = mask(0o022);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let sub = root.join("mnt");
+    let outer = root.join("outer.txt");
+    let inner = sub.join("inner.txt");
+    let inner2 = sub.join("inner2.txt");
+    let inner_mode = root.join("inner_mode.txt");
+    let inner2_mode = root.join("inner2_mode.txt");
+    let mnt_mode = root.join("mnt_mode.txt");
+    let outer_mode = root.join("outer_mode.txt");
+    let out1 = root.join("out1.txt");
+    let err1 = root.join("err1.txt");
+    let out2 = root.join("out2.txt");
+    let err2 = root.join("err2.txt");
+    make_dir(&sub, 0o700);
+    write_file(&outer, b"outer\n", 0o600);
+
+    let probe = std::process::Command::new("unshare")
+        .args(["-r", "-m", "true"])
+        .status();
+    if !probe.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("skipping: unshare -r -m not available");
+        return;
+    }
+
+    // Run 1: the mount point passed as its own root must be descended into,
+    // even though it is a mount point *relative to the outer root*.
+    // Run 2: one invocation with both the outer root and the mount-point
+    // root must fix both sides of the mount boundary.
+    let script = format!(
+        "mount -t tmpfs tmpfs '{sub}' || exit 97\n\
+         chmod 755 '{sub}'\n\
+         printf 'inner\\n' > '{inner}'\n\
+         chmod 600 '{inner}'\n\
+         {bin} '{sub}' -v > '{out1}' 2> '{err1}'\n\
+         rc1=$?\n\
+         stat -c '%a' '{inner}' > '{inner_mode}'\n\
+         printf 'inner2\\n' > '{inner2}'\n\
+         chmod 600 '{inner2}'\n\
+         {bin} '{root}' '{sub}' -v > '{out2}' 2> '{err2}'\n\
+         rc2=$?\n\
+         stat -c '%a' '{inner2}' > '{inner2_mode}'\n\
+         stat -c '%a' '{sub}' > '{mnt_mode}'\n\
+         stat -c '%a' '{outer}' > '{outer_mode}'\n\
+         umount '{sub}' 2>/dev/null\n\
+         if [ \"$rc1\" -ne 0 ]; then exit \"$rc1\"; fi\n\
+         if [ \"$rc2\" -ne 0 ]; then exit \"$rc2\"; fi\n\
+         exit 0\n",
+        sub = sub.display(),
+        inner = inner.display(),
+        inner2 = inner2.display(),
+        inner_mode = inner_mode.display(),
+        inner2_mode = inner2_mode.display(),
+        mnt_mode = mnt_mode.display(),
+        outer_mode = outer_mode.display(),
+        outer = outer.display(),
+        out1 = out1.display(),
+        err1 = err1.display(),
+        out2 = out2.display(),
+        err2 = err2.display(),
+        bin = common::bin().display(),
+        root = root.display(),
+    );
+    let st = std::process::Command::new("unshare")
+        .args(["-r", "-m", "sh", "-c", &script])
+        .status()
+        .unwrap();
+    assert!(st.success(), "mount/run script failed: {script}");
+
+    assert_eq!(
+        std::fs::read_to_string(&inner_mode).unwrap().trim(),
+        "644",
+        "file on the tmpfs must be fixed when the mount point is a root"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&inner2_mode).unwrap().trim(),
+        "644",
+        "file on the tmpfs must be fixed via the mount-point root in a combined run"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&mnt_mode).unwrap().trim(),
+        "755",
+        "the mount point itself is still chmodded"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outer_mode).unwrap().trim(),
+        "644",
+        "file on the outer root's filesystem must be fixed"
+    );
+    let out1_txt = std::fs::read_to_string(&out1).unwrap();
+    assert!(
+        out1_txt.contains("inner.txt: 0600 -> 0644"),
+        "verbose output of the mount-point root run: {out1_txt}"
+    );
+    let out2_txt = std::fs::read_to_string(&out2).unwrap();
+    assert!(
+        out2_txt.contains("inner2.txt: 0600 -> 0644"),
+        "combined run must descend the mount point: {out2_txt}"
+    );
+    assert!(
+        out2_txt.contains("skipped (mount point"),
+        "combined run must note that the outer root does not cross the mount: {out2_txt}"
+    );
 }
 
 #[test]

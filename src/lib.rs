@@ -1,8 +1,9 @@
 //! Core library for `permissions_fixer`.
 //!
-//! Walks a directory tree that stays on the root's filesystem and never
-//! follows symlinks, normalizing the permission bits of each entry to a
-//! value derived from the current process umask.
+//! Walks the given paths — directory trees, each staying on its root's
+//! filesystem, or single files — never following symlinks, and normalizes
+//! the permission bits of each entry to a value derived from the current
+//! process umask.
 
 #[cfg(not(any(
     target_os = "linux",
